@@ -6,6 +6,7 @@ function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
+  const [isAIGenerating, setIsAIGenerating] = useState(false);
 
   // Refs for audio context and nodes
   const inputAudioContextRef = useRef(null);
@@ -19,6 +20,8 @@ function App() {
   const sourcesRef = useRef(new Set());
   const wsRef = useRef(null);
   const isRecordingRef = useRef(false); // Additional ref for real-time recording state
+  const currentTurnIdRef = useRef(null);
+  const lastInterruptTimeRef = useRef(0);
 
   // Helper to create a new AudioContext
   const createInputAudioContext = () => {
@@ -86,45 +89,96 @@ function App() {
   }
 
   // Helper to play audio buffer
-  const playAudioBuffer = async (audioBuffer) => {
+  const playAudioBuffer = async (audioBuffer, turnId = null) => {
+    // Don't play audio from interrupted turns
+    if (turnId && turnId !== currentTurnIdRef.current) {
+      console.log(`Skipping audio from interrupted turn: ${turnId}`);
+      return;
+    }
+
     console.log("will play", audioBuffer)
     const source = outputAudioContextRef.current.createBufferSource();
     source.buffer = audioBuffer;
     source.connect(outputNodeRef.current);
+    
     source.onended = () => {
       sourcesRef.current.delete(source);
     };
+    
+    // CHANGE: Improved timing management for interruptions
     const now = outputAudioContextRef.current.currentTime;
-    const startTime = Math.max(nextStartTimeRef.current, now);
-    source.start(startTime);
-    nextStartTimeRef.current = startTime + audioBuffer.duration;
-    sourcesRef.current.add(source);
+    const startTime = Math.max(nextStartTimeRef.current, now + 0.01); // Small buffer to prevent timing issues
+    
+    try {
+      source.start(startTime);
+      nextStartTimeRef.current = startTime + audioBuffer.duration;
+      sourcesRef.current.add(source);
+    } catch (error) {
+      console.error('Error starting audio source:', error);
+    }
   };
 
   // Helper to decode PCM audio (assume 24kHz mono float32 PCM or WAV)
   async function decodeAudioData(arrayBuffer) {
-    // Always clone the buffer before each decode attempt
-    let clonedBuffer = arrayBuffer.slice(0);
-
     try {
-      // Try to decode as audio (WAV or supported format)
-      return await outputAudioContextRef.current.decodeAudioData(clonedBuffer);
-    } catch (err) {
-      // If decode fails, try to interpret as Float32 PCM
-      try {
-        // Clone again in case the previous decode detached the buffer
-        clonedBuffer = arrayBuffer.slice(0);
-        const float32 = new Float32Array(clonedBuffer);
-        const audioBuffer = outputAudioContextRef.current.createBuffer(1, float32.length, 24000);
-        audioBuffer.copyToChannel(float32, 0);
-        return audioBuffer;
-      } catch (fallbackErr) {
-        // If all fails, log and throw a clear error
-        console.error('Audio decode failed:', err, fallbackErr);
-        throw new Error('Audio decode failed: ' + err.message);
+      // Gemini Live API returns raw 16-bit little-endian PCM at 24kHz
+      const view = new DataView(arrayBuffer);
+      // 16-bit = 2 bytes per sample
+      const sampleCount = arrayBuffer.byteLength / 2;
+      const float32Array = new Float32Array(sampleCount);
+  
+      // Convert 16-bit PCM to Float32 with proper scaling
+      for (let i = 0; i < sampleCount; i++) {
+        const int16Sample = view.getInt16(i * 2, true); // little-endian
+        // Convert to float32 range [-1, 1] with proper scaling
+        float32Array[i] = int16Sample / (int16Sample < 0 ? 32768 : 32767);
       }
+  
+      // Create AudioBuffer with Gemini's native sample rate (24kHz)
+      const audioBuffer = outputAudioContextRef.current.createBuffer(
+        1,         // mono channel
+        sampleCount, // length in samples
+        24000      // Gemini's output sample rate
+      );
+  
+      audioBuffer.copyToChannel(float32Array, 0);
+      return audioBuffer;
+  
+    } catch (error) {
+      console.error('Audio decode failed:', error);
+      throw new Error('Audio decode failed: ' + error.message);
     }
   }
+  const handleInterruption = (turnId, timestamp) => {
+    const now = Date.now();
+    
+    // Prevent duplicate interruption handling
+    if (now - lastInterruptTimeRef.current < 100) {
+      return;
+    }
+    lastInterruptTimeRef.current = now;
+
+    console.log(`Handling interruption for turn ${turnId} at ${timestamp}`);
+    
+    // Stop all active audio sources immediately
+    sourcesRef.current.forEach((source) => {
+      try {
+        source.stop();
+      } catch (error) {
+        console.log('Source already stopped or invalid:', error);
+      }
+    });
+    sourcesRef.current.clear();
+    
+    // CHANGE: Proper timing reset - use current time, not 0
+    nextStartTimeRef.current = outputAudioContextRef.current.currentTime;
+    
+    // Reset generation state
+    setIsAIGenerating(false);
+    currentTurnIdRef.current = null;
+    
+    console.log('Interruption handled: Playback stopped and timing reset.');
+  };
 
   // WebSocket connection logic
   const connectWebSocket = () => {
@@ -144,12 +198,21 @@ function App() {
           setStatus(msg.message);
         } else if (msg.type === 'error') {
           setError(msg.message);
+        // CHANGE: Enhanced interruption handling with turn tracking
+        } else if (msg.type === 'interrupt') {
+          handleInterruption(msg.turnId, msg.timestamp);
+        // CHANGE: Added generation start tracking
+        } else if (msg.type === 'generation_start') {
+          setIsAIGenerating(true);
+          currentTurnIdRef.current = msg.turnId;
+          console.log(`AI generation started for turn: ${msg.turnId}`);
         } else if (msg.type === 'audio' && msg.data) {
           const arrayBuffer = base64ToArrayBuffer(msg.data);
           console.log("decoding", arrayBuffer)
           const audioBuffer = await decodeAudioData(arrayBuffer);
           console.log("will play")
-          playAudioBuffer(audioBuffer);
+          // CHANGE: Pass current turn ID to playback function
+          playAudioBuffer(audioBuffer, currentTurnIdRef.current);
         }
       } catch (err) {
         setError('Error handling message: ' + err.message);
@@ -205,17 +268,13 @@ const startRecording = async () => {
         int16Array[i] = Math.max(-32768, Math.min(32767, Math.floor(pcmData[i] * 32767)));
       }
       
-      // Create WAV file
-      const wav = new WaveFile();
-      wav.fromScratch(1, 16000, '16', int16Array);
-      
+      // Send raw PCM buffer directly (lower latency than WAV)
       try {
-        const wavBuffer = wav.toBuffer();
         if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(wavBuffer);
+          wsRef.current.send(int16Array.buffer);
         }
       } catch (err) {
-        console.error('Error converting/sending WAV:', err);
+        console.error('Error sending PCM:', err);
       }
     };
     
@@ -251,6 +310,14 @@ const startRecording = async () => {
       mediaStreamRef.current.getTracks().forEach((track) => track.stop());
       mediaStreamRef.current = null;
     }
+    sourcesRef.current.forEach((source) => {
+      try {
+        source.stop();
+      } catch (error) {
+        console.log('Source already stopped:', error);
+      }
+    });
+    sourcesRef.current.clear();
     
     closeWebSocket();
     
